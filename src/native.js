@@ -9,6 +9,12 @@ const textEncoder = new TextEncoder();
 const RESPONSE_FRAME_PREFIX_BYTES = 4;
 const INTERNAL_ERROR_BODY = Buffer.from('{"error":"Internal Server Error"}', "utf8");
 const responseFrameRefs = new Set();
+const platformNativeExtension =
+  process.platform === "darwin"
+    ? "dylib"
+    : process.platform === "win32"
+      ? "dll"
+      : "so";
 
 let cachedNativeModule = null;
 
@@ -95,6 +101,42 @@ function createDispatchCallback(dispatcher) {
   );
 }
 
+function buildNativePathCandidates(configuredPath) {
+  const candidates = [];
+  const pushCandidate = (candidatePath) => {
+    if (!candidatePath) {
+      return;
+    }
+
+    const absolutePath = resolve(rootDir, candidatePath);
+    if (!candidates.includes(absolutePath)) {
+      candidates.push(absolutePath);
+    }
+  };
+
+  if (configuredPath) {
+    pushCandidate(configuredPath);
+
+    if (configuredPath.endsWith(".node")) {
+      const nodeBase = configuredPath.slice(0, -".node".length);
+      pushCandidate(`${nodeBase}.${platformNativeExtension}`);
+
+      if (nodeBase.endsWith(".release")) {
+        pushCandidate(`${nodeBase.slice(0, -".release".length)}.${platformNativeExtension}`);
+      } else if (nodeBase.endsWith(".debug")) {
+        pushCandidate(`${nodeBase.slice(0, -".debug".length)}.${platformNativeExtension}`);
+      }
+    }
+
+    return candidates;
+  }
+
+  pushCandidate(`http-native.release.${suffix}`);
+  pushCandidate(`http-native.${suffix}`);
+  pushCandidate(`http-native.debug.${suffix}`);
+  return candidates;
+}
+
 function loadFfiNative() {
   if (cachedNativeModule) {
     return cachedNativeModule;
@@ -102,13 +144,14 @@ function loadFfiNative() {
 
   const configuredPath =
     process.env.HTTP_NATIVE_NATIVE_PATH ?? process.env.HTTP_NATIVE_NODE_PATH;
-  const nativeModulePath = configuredPath
-    ? resolve(rootDir, configuredPath)
-    : resolve(rootDir, `http-native.${suffix}`);
+  const candidatePaths = buildNativePathCandidates(configuredPath);
+  const nativeModulePath = candidatePaths.find((candidatePath) =>
+    existsSync(candidatePath),
+  );
 
-  if (!existsSync(nativeModulePath)) {
+  if (!nativeModulePath) {
     throw new Error(
-      `Native module not found at ${nativeModulePath}. Build it first with "bun run build".`,
+      `Native module not found. Tried: ${candidatePaths.join(", ")}. Build it first with "bun run build".`,
     );
   }
 

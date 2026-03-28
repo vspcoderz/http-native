@@ -1,6 +1,15 @@
 import { resolve } from "node:path";
 
-process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
+const nativeExt =
+  process.platform === "darwin"
+    ? "dylib"
+    : process.platform === "win32"
+      ? "dll"
+      : "so";
+process.env.HTTP_NATIVE_NATIVE_PATH ??= resolve(
+  process.cwd(),
+  `http-native.release.${nativeExt}`,
+);
 
 const { createApp } = await import("../src/index.js");
 
@@ -35,5 +44,5 @@ const server = await app.listen({
 
 console.log(`Server running at ${server.url}`);
 
-// Keep the process alive (Bun doesn't ref-count napi threads)
+// Keep the process alive while benchmarking
 setInterval(() => {}, 1 << 30);

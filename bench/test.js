@@ -23,7 +23,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     engine: "rust",
-    bridge: "napi-rs",
+    bridge: "bun:ffi",
   });
 });
 
@@ -47,7 +47,7 @@ try {
   assert.deepEqual(await rootResponse.json(), {
     ok: true,
     engine: "rust",
-    bridge: "napi-rs",
+    bridge: "bun:ffi",
   });
 
   const userResponse = await fetch(new URL("/users/42", server.url));

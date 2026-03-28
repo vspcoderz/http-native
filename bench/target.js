@@ -1,7 +1,15 @@
 import { resolve } from "node:path";
 
-process.env.HTTP_NATIVE_NODE_PATH ??= resolve(process.cwd(), "http-native.release.node");
-process.env.HTTP_NATIVE_NATIVE_PATH ??= process.env.HTTP_NATIVE_NODE_PATH;
+const nativeExt =
+  process.platform === "darwin"
+    ? "dylib"
+    : process.platform === "win32"
+      ? "dll"
+      : "so";
+process.env.HTTP_NATIVE_NATIVE_PATH ??= resolve(
+  process.cwd(),
+  `http-native.release.${nativeExt}`,
+);
 
 const { createApp: createHttpNativeApp } = await import("../src/index.js");
 
