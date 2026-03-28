@@ -45,11 +45,6 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -74,17 +69,6 @@ jobs:
             --http-native-runtime="bun" \
             --output-dir="bench/results/bun"
 
-      - name: Run benchmarks (http-native on Node)
-        run: |
-          bun bench/ci.js \
-            --engines="http-native" \
-            --scenarios="${{ github.event.inputs.scenarios || 'static,dynamic,opt' }}" \
-            --connections="${{ github.event.inputs.connections || '200' }}" \
-            --duration="${{ github.event.inputs.duration || '10s' }}" \
-            --timeout="${{ github.event.inputs.timeout || '2s' }}" \
-            --http-native-runtime="node" \
-            --output-dir="bench/results/node"
-
       - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -93,6 +77,4 @@ jobs:
           path: |
             bench/results/bun/results.json
             bench/results/bun/summary.md
-            bench/results/node/results.json
-            bench/results/node/summary.md
           if-no-files-found: ignore
