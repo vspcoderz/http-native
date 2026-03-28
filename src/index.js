@@ -2,15 +2,12 @@ import { Buffer } from "node:buffer";
 
 import {
   analyzeRequestAccess,
-  BRIDGE_VERSION,
   compileRouteShape,
   createJsonSerializer,
   createRequestFactory,
   decodeRequestEnvelope,
   encodeResponseEnvelope,
   METHOD_CODES,
-  REQUEST_FLAG_BODY_PRESENT,
-  REQUEST_FLAG_QUERY_PRESENT,
   mergeRequestAccessPlans,
   ROUTE_KIND,
   releaseRequestObject,
@@ -755,6 +752,7 @@ function createRouteResponseCache(route, applicableMiddlewares, requestPlan, opt
 
   return {
     encoded: null,
+    bunSnapshot: null,
     lastKey: "",
     stableHits: 0,
   };
@@ -904,8 +902,16 @@ function normalizeListenOptions(options = {}) {
   };
 }
 
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const EMPTY_OBJECT = Object.freeze(Object.create(null));
+const DANGEROUS_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
 
 function hasAsyncHandlers(routes, middlewares, errorHandlers) {
   return (
@@ -935,187 +941,275 @@ function splitPathSegments(pathname) {
     .filter(Boolean);
 }
 
-function shouldIncludeHeaderForRoute(headerName, route) {
-  if (route.requestPlan.fullHeaders) {
-    return true;
+function buildRequestParamObject(paramValues, paramNames, plan) {
+  if (!plan.fullParams && plan.paramKeys.size === 0) {
+    return EMPTY_OBJECT;
   }
 
-  if (route.requestPlan.headerKeys.size === 0) {
-    return false;
-  }
-
-  const normalizedName = String(headerName).toLowerCase();
-  for (const target of route.requestPlan.headerKeys) {
-    if (target.toLowerCase() === normalizedName) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function buildRequestEnvelope({
-  methodCode,
-  handlerId,
-  includeUrl,
-  includePath,
-  needsQuery,
-  url,
-  path,
-  paramValues,
-  headerEntries,
-  bodyBytes,
-}) {
-  const effectiveMethodCode = Number.isFinite(methodCode) ? methodCode : 0;
-  const payloadBody = bodyBytes instanceof Uint8Array ? bodyBytes : EMPTY_BUFFER;
-  const urlText = includeUrl ? String(url) : "";
-  const pathText = includePath ? String(path) : "";
-  const urlBytes = textEncoder.encode(urlText);
-  const pathBytes = textEncoder.encode(pathText);
-  let flags = 0;
-
-  if (needsQuery && urlText.includes("?")) {
-    flags |= REQUEST_FLAG_QUERY_PRESENT;
-  }
-
-  if (payloadBody.byteLength > 0) {
-    flags |= REQUEST_FLAG_BODY_PRESENT;
-  }
-
-  const encodedParams = [];
-  for (const value of paramValues) {
-    const encoded = textEncoder.encode(String(value));
-    if (encoded.byteLength > 0xffff) {
+  const result = Object.create(null);
+  for (let index = 0; index < paramValues.length; index += 1) {
+    const key = paramNames[index];
+    if (!key || DANGEROUS_KEYS.has(key)) {
       continue;
     }
-    encodedParams.push(encoded);
-  }
-
-  const encodedHeaders = [];
-  for (const [name, value] of headerEntries) {
-    const encodedName = textEncoder.encode(String(name));
-    const encodedValue = textEncoder.encode(String(value));
-    if (encodedName.byteLength > 0xff || encodedValue.byteLength > 0xffff) {
-      continue;
+    if (plan.fullParams || plan.paramKeys.has(key)) {
+      result[key] = paramValues[index];
     }
-    encodedHeaders.push({ name: encodedName, value: encodedValue });
   }
-
-  const frameSize =
-    22 +
-    urlBytes.byteLength +
-    pathBytes.byteLength +
-    payloadBody.byteLength +
-    encodedParams.reduce((total, encoded) => total + 2 + encoded.byteLength, 0) +
-    encodedHeaders.reduce(
-      (total, header) => total + 1 + 2 + header.name.byteLength + header.value.byteLength,
-      0,
-    );
-  const frame = Buffer.allocUnsafe(frameSize);
-  let offset = 0;
-
-  frame.writeUInt8(BRIDGE_VERSION, offset);
-  offset += 1;
-  frame.writeUInt8(effectiveMethodCode & 0xff, offset);
-  offset += 1;
-  frame.writeUInt16LE(flags, offset);
-  offset += 2;
-  frame.writeUInt32LE(handlerId >>> 0, offset);
-  offset += 4;
-  frame.writeUInt32LE(urlBytes.byteLength >>> 0, offset);
-  offset += 4;
-  frame.writeUInt16LE(pathBytes.byteLength, offset);
-  offset += 2;
-  frame.writeUInt16LE(encodedParams.length, offset);
-  offset += 2;
-  frame.writeUInt16LE(encodedHeaders.length, offset);
-  offset += 2;
-  frame.writeUInt32LE(payloadBody.byteLength >>> 0, offset);
-  offset += 4;
-
-  frame.set(urlBytes, offset);
-  offset += urlBytes.byteLength;
-  frame.set(pathBytes, offset);
-  offset += pathBytes.byteLength;
-
-  for (const encoded of encodedParams) {
-    frame.writeUInt16LE(encoded.byteLength, offset);
-    offset += 2;
-    frame.set(encoded, offset);
-    offset += encoded.byteLength;
-  }
-
-  for (const header of encodedHeaders) {
-    frame.writeUInt8(header.name.byteLength, offset);
-    offset += 1;
-    frame.writeUInt16LE(header.value.byteLength, offset);
-    offset += 2;
-    frame.set(header.name, offset);
-    offset += header.name.byteLength;
-    frame.set(header.value, offset);
-    offset += header.value.byteLength;
-  }
-
-  if (payloadBody.byteLength > 0) {
-    frame.set(payloadBody, offset);
-  }
-
-  return frame;
+  return result;
 }
 
-function decodeResponseEnvelope(responseEnvelope) {
-  const bytes = Buffer.isBuffer(responseEnvelope)
-    ? responseEnvelope
-    : responseEnvelope instanceof Uint8Array
+function pushQueryEntry(target, key, value) {
+  if (Object.hasOwn(target, key)) {
+    const current = target[key];
+    if (Array.isArray(current)) {
+      current.push(value);
+    } else {
+      target[key] = [current, value];
+    }
+    return;
+  }
+
+  target[key] = value;
+}
+
+function buildRequestQueryObject(searchParams, plan) {
+  if (!plan.fullQuery && plan.queryKeys.size === 0) {
+    return EMPTY_OBJECT;
+  }
+
+  const result = Object.create(null);
+  for (const [key, value] of searchParams) {
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
+    if (plan.fullQuery || plan.queryKeys.has(key)) {
+      pushQueryEntry(result, key, value);
+    }
+  }
+
+  return result;
+}
+
+function buildRequestHeaderObject(headers, plan) {
+  if (!plan.fullHeaders && plan.headerKeys.size === 0) {
+    return EMPTY_OBJECT;
+  }
+
+  const result = Object.create(null);
+  for (const [name, value] of headers) {
+    const key = String(name).toLowerCase();
+    if (DANGEROUS_KEYS.has(key)) {
+      continue;
+    }
+    if (plan.fullHeaders || plan.headerKeys.has(key)) {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+
+function cloneResponseSnapshot(snapshot) {
+  const headers = Object.create(null);
+  for (const key in snapshot.headers) {
+    headers[key] = snapshot.headers[key];
+  }
+
+  const body =
+    snapshot.body instanceof Uint8Array
       ? Buffer.from(
-          responseEnvelope.buffer,
-          responseEnvelope.byteOffset,
-          responseEnvelope.byteLength,
+          snapshot.body.buffer,
+          snapshot.body.byteOffset,
+          snapshot.body.byteLength,
         )
       : EMPTY_BUFFER;
 
-  if (bytes.byteLength < 8) {
-    throw new Error("response envelope too small");
-  }
-
-  let offset = 0;
-  const status = bytes.readUInt16LE(offset);
-  offset += 2;
-  const headerCount = bytes.readUInt16LE(offset);
-  offset += 2;
-  const bodyLength = bytes.readUInt32LE(offset);
-  offset += 4;
-  const headers = new Headers();
-
-  for (let index = 0; index < headerCount; index += 1) {
-    if (offset + 3 > bytes.byteLength) {
-      throw new Error("response envelope header truncated");
-    }
-
-    const nameLength = bytes.readUInt8(offset);
-    offset += 1;
-    const valueLength = bytes.readUInt16LE(offset);
-    offset += 2;
-
-    if (offset + nameLength + valueLength > bytes.byteLength) {
-      throw new Error("response envelope header value truncated");
-    }
-
-    const name = textDecoder.decode(bytes.subarray(offset, offset + nameLength));
-    offset += nameLength;
-    const value = textDecoder.decode(bytes.subarray(offset, offset + valueLength));
-    offset += valueLength;
-    headers.set(name, value);
-  }
-
-  if (offset + bodyLength > bytes.byteLength) {
-    throw new Error("response envelope body truncated");
-  }
-
   return {
-    status,
+    status: snapshot.status,
     headers,
-    body: bytes.subarray(offset, offset + bodyLength),
+    body,
+  };
+}
+
+function createBunRequestObject(
+  route,
+  request,
+  requestUrl,
+  normalizedPath,
+  paramValues,
+  bodyBytes,
+) {
+  const plan = route?.requestPlan ?? ERROR_REQUEST_PLAN;
+  const paramNames = route?.paramNames ?? EMPTY_ARRAY;
+  let paramsCache;
+  let queryCache;
+  let headersCache;
+  let bodyParsed;
+
+  const req = Object.create(null);
+  req.method = request.method;
+  req.path = normalizedPath;
+  req.url = requestUrl.pathname + requestUrl.search;
+
+  Object.defineProperty(req, "params", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (paramsCache === undefined) {
+        paramsCache = buildRequestParamObject(paramValues, paramNames, plan);
+      }
+      return paramsCache;
+    },
+  });
+
+  Object.defineProperty(req, "query", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (queryCache === undefined) {
+        queryCache = buildRequestQueryObject(requestUrl.searchParams, plan);
+      }
+      return queryCache;
+    },
+  });
+
+  Object.defineProperty(req, "headers", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (headersCache === undefined) {
+        headersCache = buildRequestHeaderObject(request.headers, plan);
+      }
+      return headersCache;
+    },
+  });
+
+  req.header = function header(name) {
+    const value = request.headers.get(String(name));
+    return value ?? undefined;
+  };
+
+  req.json = function json() {
+    if (bodyParsed !== undefined) {
+      return bodyParsed;
+    }
+    if (!bodyBytes || bodyBytes.length === 0) {
+      bodyParsed = null;
+      return null;
+    }
+    bodyParsed = JSON.parse(bodyBytes.toString("utf8"));
+    return bodyParsed;
+  };
+
+  req.text = function text() {
+    if (!bodyBytes || bodyBytes.length === 0) {
+      return "";
+    }
+    return bodyBytes.toString("utf8");
+  };
+
+  req.arrayBuffer = function arrayBuffer() {
+    if (!bodyBytes || bodyBytes.length === 0) {
+      return new ArrayBuffer(0);
+    }
+    return bodyBytes.buffer.slice(
+      bodyBytes.byteOffset,
+      bodyBytes.byteOffset + bodyBytes.byteLength,
+    );
+  };
+
+  return req;
+}
+
+function maybePromoteRouteBunSnapshotCache(route, snapshot) {
+  const cache = route.runtimeResponseCache;
+  if (!cache || cache.bunSnapshot) {
+    return;
+  }
+
+  const key = buildSnapshotCacheKey(snapshot);
+  if (key === cache.lastKey) {
+    cache.stableHits += 1;
+  } else {
+    cache.lastKey = key;
+    cache.stableHits = 1;
+  }
+
+  if (cache.stableHits >= ROUTE_CACHE_PROMOTE_HITS) {
+    cache.bunSnapshot = cloneResponseSnapshot(snapshot);
+  }
+}
+
+function createBunDirectDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
+  async function finalizeError(error, req, res, snapshot, release, fallbackStatus = 500) {
+    try {
+      if (!res.finished) {
+        for (const errorHandler of errorHandlers) {
+          const result = errorHandler(error, req, res);
+          if (!res.finished && isPromiseLike(result)) {
+            await result;
+          }
+          if (res.finished) {
+            break;
+          }
+        }
+      }
+
+      if (!res.finished) {
+        return buildDefaultErrorSnapshot(error, fallbackStatus);
+      }
+
+      return cloneResponseSnapshot(snapshot());
+    } catch {
+      return buildDefaultErrorSnapshot(error, fallbackStatus);
+    } finally {
+      release();
+    }
+  }
+
+  return async function dispatch(route, req) {
+    if (!route) {
+      const { response: res, snapshot, release } = createResponseEnvelope();
+      return finalizeError(
+        createHttpError(404, "Route not found", "NOT_FOUND"),
+        req,
+        res,
+        snapshot,
+        release,
+        404,
+      );
+    }
+
+    const cachedSnapshot = route.runtimeResponseCache?.bunSnapshot;
+    if (cachedSnapshot) {
+      return cachedSnapshot;
+    }
+
+    const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
+
+    try {
+      const middlewareResult = route.runMiddlewares(req, res);
+      if (!res.finished && isPromiseLike(middlewareResult)) {
+        await middlewareResult;
+      }
+      if (!res.finished) {
+        const handlerResult = route.compiledHandler(req, res);
+        if (!res.finished && isPromiseLike(handlerResult)) {
+          await handlerResult;
+        }
+      }
+    } catch (error) {
+      return finalizeError(error, req, res, snapshot, release, 500);
+    }
+
+    const responseSnapshot = cloneResponseSnapshot(snapshot());
+    if (!isBridgeBypassedRoute(route)) {
+      runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
+    }
+    maybePromoteRouteBunSnapshotCache(route, responseSnapshot);
+    release();
+    return responseSnapshot;
   };
 }
 
@@ -1193,61 +1287,39 @@ function createRouteMatcher(compiledRoutes) {
 
 async function startBunServerBridge(
   compiledRoutes,
-  dispatcher,
-  normalizedOptions,
   runtimeOptimizer,
+  errorHandlers,
+  normalizedOptions,
 ) {
   const matchRoute = createRouteMatcher(compiledRoutes);
+  const dispatchDirect = createBunDirectDispatcher(
+    compiledRoutes,
+    runtimeOptimizer,
+    errorHandlers,
+  );
   const fetchHandler = async (request) => {
     try {
       const requestUrl = new URL(request.url);
       const methodCode = METHOD_CODES[request.method] ?? 0;
       const normalizedPath = normalizeRuntimePath(requestUrl.pathname);
       const matched = matchRoute(methodCode, normalizedPath);
-      const requestHeaders = [...request.headers.entries()];
       const bodyBytes =
         request.method === "GET" || request.method === "HEAD"
           ? EMPTY_BUFFER
           : Buffer.from(await request.arrayBuffer());
-      const requestEnvelope = matched
-        ? buildRequestEnvelope({
-            methodCode,
-            handlerId: matched.route.handlerId,
-            includeUrl:
-              matched.route.requestPlan.url ||
-              matched.route.requestPlan.fullQuery ||
-              matched.route.requestPlan.queryKeys.size > 0,
-            includePath: matched.route.requestPlan.path,
-            needsQuery:
-              matched.route.requestPlan.fullQuery ||
-              matched.route.requestPlan.queryKeys.size > 0,
-            url: requestUrl.pathname + requestUrl.search,
-            path: normalizedPath,
-            paramValues: matched.paramValues,
-            headerEntries: matched.route.requestPlan.fullHeaders
-              ? requestHeaders
-              : requestHeaders.filter(([name]) =>
-                  shouldIncludeHeaderForRoute(name, matched.route),
-                ),
-            bodyBytes,
-          })
-        : buildRequestEnvelope({
-            methodCode,
-            handlerId: 0,
-            includeUrl: true,
-            includePath: true,
-            needsQuery: true,
-            url: requestUrl.pathname + requestUrl.search,
-            path: normalizedPath,
-            paramValues: EMPTY_ARRAY,
-            headerEntries: requestHeaders,
-            bodyBytes,
-          });
-      const responseEnvelope = await dispatcher(requestEnvelope);
-      const decoded = decodeResponseEnvelope(responseEnvelope);
-      return new Response(decoded.body, {
-        status: decoded.status,
-        headers: decoded.headers,
+      const route = matched?.route ?? null;
+      const req = createBunRequestObject(
+        route,
+        request,
+        requestUrl,
+        normalizedPath,
+        matched?.paramValues ?? EMPTY_ARRAY,
+        bodyBytes,
+      );
+      const snapshot = await dispatchDirect(route, req);
+      return new Response(snapshot.body, {
+        status: snapshot.status,
+        headers: snapshot.headers,
       });
     } catch {
       return new Response('{"error":"Internal Server Error"}', {
@@ -1429,18 +1501,20 @@ export function createApp() {
         (route) => !isBridgeBypassedRoute(route),
       );
       const shouldUseBunServerBridge = containsAsyncHandlers || requiresBridgeDispatch;
-      const dispatcher = shouldUseBunServerBridge
-        ? createDispatcher(compiledRoutes, runtimeOptimizer, this._errorHandlers)
-        : createDispatcherSync(compiledRoutes, runtimeOptimizer, this._errorHandlers);
       if (shouldUseBunServerBridge) {
         return startBunServerBridge(
           compiledRoutes,
-          dispatcher,
-          normalizedOptions,
           runtimeOptimizer,
+          this._errorHandlers,
+          normalizedOptions,
         );
       }
 
+      const dispatcher = createDispatcherSync(
+        compiledRoutes,
+        runtimeOptimizer,
+        this._errorHandlers,
+      );
       const native = loadNativeModule();
       const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
         host: normalizedOptions.host,
