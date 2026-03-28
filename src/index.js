@@ -2,12 +2,17 @@ import { Buffer } from "node:buffer";
 
 import {
   analyzeRequestAccess,
+  BRIDGE_VERSION,
   compileRouteShape,
   createJsonSerializer,
   createRequestFactory,
   decodeRequestEnvelope,
   encodeResponseEnvelope,
+  METHOD_CODES,
+  REQUEST_FLAG_BODY_PRESENT,
+  REQUEST_FLAG_QUERY_PRESENT,
   mergeRequestAccessPlans,
+  ROUTE_KIND,
   releaseRequestObject,
 } from "./bridge.js";
 import { loadNativeModule } from "./native.js";
@@ -19,6 +24,7 @@ import { createRuntimeOptimizer } from "../opt/runtime.js";
 const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"];
 const ACTIVE_NATIVE_SERVERS = new Set();
 const EMPTY_BUFFER = Buffer.alloc(0);
+const EMPTY_ARRAY = Object.freeze([]);
 const NOOP_NEXT = () => undefined;
 const ROUTE_CACHE_PROMOTE_HITS = 16;
 const ERROR_REQUEST_PLAN = Object.freeze({
@@ -452,13 +458,130 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
     }
 
     const responseSnapshot = snapshot();
-    runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
+    if (!isBridgeBypassedRoute(route)) {
+      runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
+    }
     const encoded = encodeResponseEnvelope(responseSnapshot);
     maybePromoteRouteResponseCache(route, responseSnapshot, encoded);
     releaseRequestObject(req);
     release();
     return encoded;
   };
+}
+
+function isStaticFastPathRoute(route) {
+  if (route.method !== "GET" || route.path.includes(":")) {
+    return false;
+  }
+
+  if ((route.applicableMiddlewares?.length ?? 0) > 0) {
+    return false;
+  }
+
+  const source = route.handlerSource ?? "";
+  if (source.includes("await")) {
+    return false;
+  }
+
+  const body = trimReturnAndSemicolon(extractFunctionBody(source));
+  if (!body) {
+    return false;
+  }
+
+  return (
+    isDirectLiteralCall(body, "res.json(") ||
+    isDirectLiteralCall(body, "res.send(") ||
+    isDirectStatusLiteralCall(body, "json") ||
+    isDirectStatusLiteralCall(body, "send")
+  );
+}
+
+function isBridgeBypassedRoute(route) {
+  if (isStaticFastPathRoute(route)) {
+    return true;
+  }
+
+  return (
+    route.dispatchKind === "specialized" &&
+    route.jsonFastPath === "specialized" &&
+    (route.applicableMiddlewares?.length ?? 0) === 0
+  );
+}
+
+function extractFunctionBody(source) {
+  const arrowIndex = source.indexOf("=>");
+  if (arrowIndex >= 0) {
+    const right = source.slice(arrowIndex + 2).trim();
+    if (right.startsWith("{") && right.endsWith("}")) {
+      return right.slice(1, -1).trim();
+    }
+    return right;
+  }
+
+  const blockStart = source.indexOf("{");
+  const blockEnd = source.lastIndexOf("}");
+  if (blockStart >= 0 && blockEnd > blockStart) {
+    return source.slice(blockStart + 1, blockEnd).trim();
+  }
+
+  return source.trim();
+}
+
+function trimReturnAndSemicolon(body) {
+  let value = body.trim();
+  if (value.startsWith("return ")) {
+    value = value.slice("return ".length).trim();
+  }
+  if (value.endsWith(";")) {
+    value = value.slice(0, -1).trim();
+  }
+  return value;
+}
+
+function isDirectLiteralCall(body, prefix) {
+  if (!body.startsWith(prefix) || !body.endsWith(")")) {
+    return false;
+  }
+
+  const payload = body.slice(prefix.length, -1).trim();
+  return looksLiteralPayload(payload);
+}
+
+function isDirectStatusLiteralCall(body, method) {
+  if (!body.startsWith("res.status(") || !body.endsWith(")")) {
+    return false;
+  }
+
+  const separator = `).${method}(`;
+  const separatorIndex = body.indexOf(separator);
+  if (separatorIndex < 0) {
+    return false;
+  }
+
+  const payload = body.slice(separatorIndex + separator.length, -1).trim();
+  return looksLiteralPayload(payload);
+}
+
+function looksLiteralPayload(payload) {
+  if (!payload) {
+    return false;
+  }
+
+  if (
+    payload.startsWith("{") ||
+    payload.startsWith("[") ||
+    payload.startsWith('"') ||
+    payload.startsWith("'") ||
+    payload.startsWith("`")
+  ) {
+    return true;
+  }
+
+  if (/^-?\d/.test(payload)) {
+    return true;
+  }
+
+  return payload === "true" || payload === "false" || payload === "null";
 }
 
 // ─── Route Registration & Compilation ─────────────────────────────────────────
@@ -662,10 +785,421 @@ function normalizeListenOptions(options = {}) {
   };
 }
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+function hasAsyncHandlers(routes, middlewares, errorHandlers) {
+  return (
+    routes.some((route) => route?.handler?.constructor?.name === "AsyncFunction") ||
+    middlewares.some((middleware) => middleware?.handler?.constructor?.name === "AsyncFunction") ||
+    errorHandlers.some((handler) => handler?.constructor?.name === "AsyncFunction")
+  );
+}
+
+function normalizeRuntimePath(pathname) {
+  if (pathname === "/") {
+    return "/";
+  }
+
+  const trimmed = String(pathname).replace(/\/+$/, "");
+  return trimmed || "/";
+}
+
+function splitPathSegments(pathname) {
+  if (pathname === "/") {
+    return EMPTY_ARRAY;
+  }
+
+  return pathname
+    .slice(1)
+    .split("/")
+    .filter(Boolean);
+}
+
+function shouldIncludeHeaderForRoute(headerName, route) {
+  if (route.requestPlan.fullHeaders) {
+    return true;
+  }
+
+  if (route.requestPlan.headerKeys.size === 0) {
+    return false;
+  }
+
+  const normalizedName = String(headerName).toLowerCase();
+  for (const target of route.requestPlan.headerKeys) {
+    if (target.toLowerCase() === normalizedName) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildRequestEnvelope({
+  methodCode,
+  handlerId,
+  includeUrl,
+  includePath,
+  needsQuery,
+  url,
+  path,
+  paramValues,
+  headerEntries,
+  bodyBytes,
+}) {
+  const effectiveMethodCode = Number.isFinite(methodCode) ? methodCode : 0;
+  const payloadBody = bodyBytes instanceof Uint8Array ? bodyBytes : EMPTY_BUFFER;
+  const urlText = includeUrl ? String(url) : "";
+  const pathText = includePath ? String(path) : "";
+  const urlBytes = textEncoder.encode(urlText);
+  const pathBytes = textEncoder.encode(pathText);
+  let flags = 0;
+
+  if (needsQuery && urlText.includes("?")) {
+    flags |= REQUEST_FLAG_QUERY_PRESENT;
+  }
+
+  if (payloadBody.byteLength > 0) {
+    flags |= REQUEST_FLAG_BODY_PRESENT;
+  }
+
+  const encodedParams = [];
+  for (const value of paramValues) {
+    const encoded = textEncoder.encode(String(value));
+    if (encoded.byteLength > 0xffff) {
+      continue;
+    }
+    encodedParams.push(encoded);
+  }
+
+  const encodedHeaders = [];
+  for (const [name, value] of headerEntries) {
+    const encodedName = textEncoder.encode(String(name));
+    const encodedValue = textEncoder.encode(String(value));
+    if (encodedName.byteLength > 0xff || encodedValue.byteLength > 0xffff) {
+      continue;
+    }
+    encodedHeaders.push({ name: encodedName, value: encodedValue });
+  }
+
+  const frameSize =
+    22 +
+    urlBytes.byteLength +
+    pathBytes.byteLength +
+    payloadBody.byteLength +
+    encodedParams.reduce((total, encoded) => total + 2 + encoded.byteLength, 0) +
+    encodedHeaders.reduce(
+      (total, header) => total + 1 + 2 + header.name.byteLength + header.value.byteLength,
+      0,
+    );
+  const frame = Buffer.allocUnsafe(frameSize);
+  let offset = 0;
+
+  frame.writeUInt8(BRIDGE_VERSION, offset);
+  offset += 1;
+  frame.writeUInt8(effectiveMethodCode & 0xff, offset);
+  offset += 1;
+  frame.writeUInt16LE(flags, offset);
+  offset += 2;
+  frame.writeUInt32LE(handlerId >>> 0, offset);
+  offset += 4;
+  frame.writeUInt32LE(urlBytes.byteLength >>> 0, offset);
+  offset += 4;
+  frame.writeUInt16LE(pathBytes.byteLength, offset);
+  offset += 2;
+  frame.writeUInt16LE(encodedParams.length, offset);
+  offset += 2;
+  frame.writeUInt16LE(encodedHeaders.length, offset);
+  offset += 2;
+  frame.writeUInt32LE(payloadBody.byteLength >>> 0, offset);
+  offset += 4;
+
+  frame.set(urlBytes, offset);
+  offset += urlBytes.byteLength;
+  frame.set(pathBytes, offset);
+  offset += pathBytes.byteLength;
+
+  for (const encoded of encodedParams) {
+    frame.writeUInt16LE(encoded.byteLength, offset);
+    offset += 2;
+    frame.set(encoded, offset);
+    offset += encoded.byteLength;
+  }
+
+  for (const header of encodedHeaders) {
+    frame.writeUInt8(header.name.byteLength, offset);
+    offset += 1;
+    frame.writeUInt16LE(header.value.byteLength, offset);
+    offset += 2;
+    frame.set(header.name, offset);
+    offset += header.name.byteLength;
+    frame.set(header.value, offset);
+    offset += header.value.byteLength;
+  }
+
+  if (payloadBody.byteLength > 0) {
+    frame.set(payloadBody, offset);
+  }
+
+  return frame;
+}
+
+function decodeResponseEnvelope(responseEnvelope) {
+  const bytes = Buffer.isBuffer(responseEnvelope)
+    ? responseEnvelope
+    : responseEnvelope instanceof Uint8Array
+      ? Buffer.from(
+          responseEnvelope.buffer,
+          responseEnvelope.byteOffset,
+          responseEnvelope.byteLength,
+        )
+      : EMPTY_BUFFER;
+
+  if (bytes.byteLength < 8) {
+    throw new Error("response envelope too small");
+  }
+
+  let offset = 0;
+  const status = bytes.readUInt16LE(offset);
+  offset += 2;
+  const headerCount = bytes.readUInt16LE(offset);
+  offset += 2;
+  const bodyLength = bytes.readUInt32LE(offset);
+  offset += 4;
+  const headers = new Headers();
+
+  for (let index = 0; index < headerCount; index += 1) {
+    if (offset + 3 > bytes.byteLength) {
+      throw new Error("response envelope header truncated");
+    }
+
+    const nameLength = bytes.readUInt8(offset);
+    offset += 1;
+    const valueLength = bytes.readUInt16LE(offset);
+    offset += 2;
+
+    if (offset + nameLength + valueLength > bytes.byteLength) {
+      throw new Error("response envelope header value truncated");
+    }
+
+    const name = textDecoder.decode(bytes.subarray(offset, offset + nameLength));
+    offset += nameLength;
+    const value = textDecoder.decode(bytes.subarray(offset, offset + valueLength));
+    offset += valueLength;
+    headers.set(name, value);
+  }
+
+  if (offset + bodyLength > bytes.byteLength) {
+    throw new Error("response envelope body truncated");
+  }
+
+  return {
+    status,
+    headers,
+    body: bytes.subarray(offset, offset + bodyLength),
+  };
+}
+
+function createRouteMatcher(compiledRoutes) {
+  const perMethod = new Map();
+
+  for (const route of compiledRoutes) {
+    let bucket = perMethod.get(route.methodCode);
+    if (!bucket) {
+      bucket = {
+        exact: new Map(),
+        dynamic: [],
+      };
+      perMethod.set(route.methodCode, bucket);
+    }
+
+    if (route.routeKind === ROUTE_KIND.EXACT) {
+      bucket.exact.set(route.path, route);
+      continue;
+    }
+
+    bucket.dynamic.push({
+      route,
+      segments: splitPathSegments(route.path),
+    });
+  }
+
+  return function matchRoute(methodCode, normalizedPath) {
+    const bucket = perMethod.get(methodCode);
+    if (!bucket) {
+      return null;
+    }
+
+    const exact = bucket.exact.get(normalizedPath);
+    if (exact) {
+      return {
+        route: exact,
+        paramValues: EMPTY_ARRAY,
+      };
+    }
+
+    const requestSegments = splitPathSegments(normalizedPath);
+    for (const candidate of bucket.dynamic) {
+      if (candidate.segments.length !== requestSegments.length) {
+        continue;
+      }
+
+      const paramValues = [];
+      let matches = true;
+      for (let index = 0; index < candidate.segments.length; index += 1) {
+        const routeSegment = candidate.segments[index];
+        const requestSegment = requestSegments[index];
+        if (routeSegment.startsWith(":")) {
+          paramValues.push(requestSegment);
+          continue;
+        }
+
+        if (routeSegment !== requestSegment) {
+          matches = false;
+          break;
+        }
+      }
+
+      if (matches) {
+        return {
+          route: candidate.route,
+          paramValues,
+        };
+      }
+    }
+
+    return null;
+  };
+}
+
+async function startBunServerBridge(
+  compiledRoutes,
+  dispatcher,
+  normalizedOptions,
+  runtimeOptimizer,
+) {
+  const matchRoute = createRouteMatcher(compiledRoutes);
+  const fetchHandler = async (request) => {
+    try {
+      const requestUrl = new URL(request.url);
+      const methodCode = METHOD_CODES[request.method] ?? 0;
+      const normalizedPath = normalizeRuntimePath(requestUrl.pathname);
+      const matched = matchRoute(methodCode, normalizedPath);
+      const requestHeaders = [...request.headers.entries()];
+      const bodyBytes =
+        request.method === "GET" || request.method === "HEAD"
+          ? EMPTY_BUFFER
+          : Buffer.from(await request.arrayBuffer());
+      const requestEnvelope = matched
+        ? buildRequestEnvelope({
+            methodCode,
+            handlerId: matched.route.handlerId,
+            includeUrl:
+              matched.route.requestPlan.url ||
+              matched.route.requestPlan.fullQuery ||
+              matched.route.requestPlan.queryKeys.size > 0,
+            includePath: matched.route.requestPlan.path,
+            needsQuery:
+              matched.route.requestPlan.fullQuery ||
+              matched.route.requestPlan.queryKeys.size > 0,
+            url: requestUrl.pathname + requestUrl.search,
+            path: normalizedPath,
+            paramValues: matched.paramValues,
+            headerEntries: matched.route.requestPlan.fullHeaders
+              ? requestHeaders
+              : requestHeaders.filter(([name]) =>
+                  shouldIncludeHeaderForRoute(name, matched.route),
+                ),
+            bodyBytes,
+          })
+        : buildRequestEnvelope({
+            methodCode,
+            handlerId: 0,
+            includeUrl: true,
+            includePath: true,
+            needsQuery: true,
+            url: requestUrl.pathname + requestUrl.search,
+            path: normalizedPath,
+            paramValues: EMPTY_ARRAY,
+            headerEntries: requestHeaders,
+            bodyBytes,
+          });
+      const responseEnvelope = await dispatcher(requestEnvelope);
+      const decoded = decodeResponseEnvelope(responseEnvelope);
+      return new Response(decoded.body, {
+        status: decoded.status,
+        headers: decoded.headers,
+      });
+    } catch {
+      return new Response('{"error":"Internal Server Error"}', {
+        status: 500,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+        },
+      });
+    }
+  };
+
+  let server;
+  let lastBindError;
+  const requestedPort = normalizedOptions.port;
+  const maxPortAttempts = requestedPort === 0 ? 16 : 1;
+
+  for (let attempt = 0; attempt < maxPortAttempts; attempt += 1) {
+    const candidatePort =
+      requestedPort === 0
+        ? 30000 + Math.floor(Math.random() * 20000)
+        : requestedPort;
+    try {
+      server = Bun.serve({
+        hostname: normalizedOptions.host,
+        port: candidatePort,
+        fetch: fetchHandler,
+      });
+      break;
+    } catch (error) {
+      lastBindError = error;
+      if (requestedPort !== 0) {
+        throw error;
+      }
+    }
+  }
+
+  if (!server) {
+    throw lastBindError ?? new Error("Failed to bind Bun server");
+  }
+
+  ACTIVE_NATIVE_SERVERS.add(server);
+  const host = server.hostname;
+  const port = Number(server.port);
+  const url =
+    typeof server.url === "string"
+      ? server.url
+      : server.url?.toString?.() ?? `http://${host}:${port}`;
+
+  return {
+    host,
+    port,
+    url,
+    _handle: server,
+    optimizations: {
+      snapshot() {
+        return runtimeOptimizer.snapshot();
+      },
+      summary() {
+        return runtimeOptimizer.summary();
+      },
+    },
+    close() {
+      ACTIVE_NATIVE_SERVERS.delete(server);
+      server.stop(true);
+    },
+  };
+}
+
 // ─── Application Factory ─────────────────────────────────────────────────────
 
 export function createApp() {
-  const native = loadNativeModule();
   let nextHandlerId = 1;
 
   const app = {
@@ -712,6 +1246,11 @@ export function createApp() {
 
     async listen(options = {}) {
       const normalizedOptions = normalizeListenOptions(options);
+      const containsAsyncHandlers = hasAsyncHandlers(
+        this._routes,
+        this._middlewares,
+        this._errorHandlers,
+      );
       const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
       const errorHandlerPlans = this._errorHandlers.map((handler) =>
         analyzeRequestAccess(Function.prototype.toString.call(handler)),
@@ -768,6 +1307,16 @@ export function createApp() {
         normalizedOptions.opt,
       );
       const dispatcher = createDispatcher(compiledRoutes, runtimeOptimizer, this._errorHandlers);
+      if (containsAsyncHandlers) {
+        return startBunServerBridge(
+          compiledRoutes,
+          dispatcher,
+          normalizedOptions,
+          runtimeOptimizer,
+        );
+      }
+
+      const native = loadNativeModule();
       const handle = native.startServer(JSON.stringify(manifest), dispatcher, {
         host: normalizedOptions.host,
         port: normalizedOptions.port,

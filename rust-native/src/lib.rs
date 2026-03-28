@@ -7,13 +7,12 @@ use bytes::Bytes;
 use memchr::memmem;
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
-use napi::bindgen_prelude::{Buffer, Function, Promise};
-use napi::threadsafe_function::ThreadsafeFunction;
-use napi::{Error, Status};
-use napi_derive::napi;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::ffi::{c_char, CString};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::ptr;
+use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use url::form_urlencoded;
@@ -60,8 +59,12 @@ const BUFFER_INITIAL_CAPACITY: usize = 8192;
 const BUFFER_POOL_MAX_SIZE: usize = 256;
 /// Buffer pool: max buffer size to recycle (don't recycle oversized buffers)
 const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
+const DISPATCH_FRAME_HEADER_BYTES: usize = 4;
+const MAX_DISPATCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-type DispatchTsfn = ThreadsafeFunction<Buffer, Promise<Buffer>, Buffer, Status, false, false, 0>;
+type Buffer = Vec<u8>;
+type DispatchCallback = unsafe extern "C" fn(*const u8, usize) -> *const u8;
+static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
 // ─── Thread-Local Buffer Pool ─────────────────────────────────────────────────
 //
@@ -170,9 +173,8 @@ impl HttpServerConfig {
     }
 }
 
-// ─── NAPI Interface ───────────────────────────────────────────────────────────
+// ─── FFI Interface ────────────────────────────────────────────────────────────
 
-#[napi(object)]
 pub struct NativeListenOptions {
     pub host: Option<String>,
     pub port: u16,
@@ -184,7 +186,6 @@ struct ShutdownHandle {
     wake_addrs: Vec<SocketAddr>,
 }
 
-#[napi]
 pub struct NativeServerHandle {
     host: String,
     port: u32,
@@ -193,25 +194,20 @@ pub struct NativeServerHandle {
     closed: Mutex<Option<Vec<mpsc::Receiver<()>>>>,
 }
 
-#[napi]
 impl NativeServerHandle {
-    #[napi(getter)]
     pub fn host(&self) -> String {
         self.host.clone()
     }
 
-    #[napi(getter)]
     pub fn port(&self) -> u32 {
         self.port
     }
 
-    #[napi(getter)]
     pub fn url(&self) -> String {
         self.url.clone()
     }
 
-    #[napi]
-    pub fn close(&self) -> napi::Result<()> {
+    pub fn close(&self) -> Result<()> {
         if let Some(shutdown) = self
             .shutdown
             .lock()
@@ -234,23 +230,15 @@ impl NativeServerHandle {
     }
 }
 
-#[napi]
-pub fn start_server(
-    manifest_json: String,
-    dispatcher: Function<'_, Buffer, Promise<Buffer>>,
+fn start_server_internal(
+    manifest_json: &str,
+    dispatcher: Arc<JsDispatcher>,
     options: NativeListenOptions,
-) -> napi::Result<NativeServerHandle> {
-    let manifest: ManifestInput = serde_json::from_str(&manifest_json).map_err(to_napi_error)?;
-    validate_manifest(&manifest).map_err(to_napi_error)?;
-    let server_config =
-        Arc::new(HttpServerConfig::from_manifest(&manifest).map_err(to_napi_error)?);
-    let router = Arc::new(Router::from_manifest(&manifest).map_err(to_napi_error)?);
-
-    let callback: DispatchTsfn = dispatcher
-        .build_threadsafe_function::<Buffer>()
-        .build()
-        .map_err(to_napi_error)?;
-    let dispatcher = Arc::new(JsDispatcher { callback });
+) -> Result<NativeServerHandle> {
+    let manifest: ManifestInput = serde_json::from_str(manifest_json)?;
+    validate_manifest(&manifest)?;
+    let server_config = Arc::new(HttpServerConfig::from_manifest(&manifest)?);
+    let router = Arc::new(Router::from_manifest(&manifest)?);
 
     let worker_count = worker_count_for(&options);
     let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(worker_count);
@@ -322,7 +310,7 @@ pub fn start_server(
                 for receiver in closed_receivers {
                     let _ = receiver.recv();
                 }
-                return Err(Error::from_reason(message));
+                return Err(anyhow!(message));
             }
             Err(_) => {
                 shutdown_flag.store(true, Ordering::SeqCst);
@@ -332,9 +320,7 @@ pub fn start_server(
                 for receiver in closed_receivers {
                     let _ = receiver.recv();
                 }
-                return Err(Error::from_reason(
-                    "Native server exited before reporting readiness".to_string(),
-                ));
+                return Err(anyhow!("Native server exited before reporting readiness"));
             }
         }
     }
@@ -356,6 +342,113 @@ pub fn start_server(
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn http_native_start_server(
+    manifest_json_ptr: *const u8,
+    manifest_json_len: usize,
+    dispatch_callback: Option<DispatchCallback>,
+    host_ptr: *const u8,
+    host_len: usize,
+    port: u16,
+    backlog: i32,
+) -> *mut NativeServerHandle {
+    let start_result = (|| -> Result<NativeServerHandle> {
+        let manifest_json = read_required_utf8(manifest_json_ptr, manifest_json_len, "manifest_json")?;
+        let host = read_optional_utf8(host_ptr, host_len, "host")?;
+        let callback = dispatch_callback.ok_or_else(|| anyhow!("dispatch callback was null"))?;
+        let options = NativeListenOptions {
+            host,
+            port,
+            backlog: (backlog > 0).then_some(backlog),
+        };
+
+        start_server_internal(
+            manifest_json.as_str(),
+            Arc::new(JsDispatcher { callback }),
+            options,
+        )
+    })();
+
+    match start_result {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle))
+        }
+        Err(error) => {
+            set_last_error(error.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn http_native_take_last_error() -> *mut c_char {
+    let mut slot = LAST_ERROR.lock().expect("last error mutex poisoned");
+    match slot.take() {
+        Some(message) => message.into_raw(),
+        None => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_string_free(value: *mut c_char) {
+    if !value.is_null() {
+        let _ = CString::from_raw(value);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_server_snapshot_json(
+    handle: *const NativeServerHandle,
+) -> *mut c_char {
+    if handle.is_null() {
+        set_last_error("server handle was null");
+        return ptr::null_mut();
+    }
+
+    let handle_ref = &*handle;
+    let snapshot = serde_json::json!({
+        "host": handle_ref.host(),
+        "port": handle_ref.port(),
+        "url": handle_ref.url(),
+    })
+    .to_string();
+
+    match CString::new(snapshot) {
+        Ok(value) => value.into_raw(),
+        Err(_) => {
+            set_last_error("failed to encode server snapshot");
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_server_close(handle: *mut NativeServerHandle) -> bool {
+    if handle.is_null() {
+        set_last_error("server handle was null");
+        return false;
+    }
+
+    match (&*handle).close() {
+        Ok(()) => {
+            clear_last_error();
+            true
+        }
+        Err(error) => {
+            set_last_error(error.to_string());
+            false
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_server_free(handle: *mut NativeServerHandle) {
+    if !handle.is_null() {
+        drop(Box::from_raw(handle));
+    }
+}
+
 fn worker_count_for(options: &NativeListenOptions) -> usize {
     if options.port == 0 {
         return 1;
@@ -371,20 +464,34 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
 // ─── JS Dispatcher ────────────────────────────────────────────────────────────
 
 struct JsDispatcher {
-    callback: DispatchTsfn,
+    callback: DispatchCallback,
 }
 
 impl JsDispatcher {
     async fn dispatch(&self, request: Buffer) -> Result<Buffer> {
-        let response_json = self
-            .callback
-            .call_async(request)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+        let response_ptr = unsafe { (self.callback)(request.as_ptr(), request.len()) };
+        if response_ptr.is_null() {
+            return Err(anyhow!("dispatcher callback returned a null response"));
+        }
 
-        Ok(response_json)
+        let frame_header =
+            unsafe { slice::from_raw_parts(response_ptr, DISPATCH_FRAME_HEADER_BYTES) };
+        let response_len = u32::from_le_bytes([
+            frame_header[0],
+            frame_header[1],
+            frame_header[2],
+            frame_header[3],
+        ]) as usize;
+
+        if response_len > MAX_DISPATCH_RESPONSE_BYTES {
+            return Err(anyhow!("dispatch response exceeded limit"));
+        }
+
+        let frame_len = DISPATCH_FRAME_HEADER_BYTES
+            .checked_add(response_len)
+            .ok_or_else(|| anyhow!("dispatch response frame overflow"))?;
+        let frame = unsafe { slice::from_raw_parts(response_ptr, frame_len) };
+        Ok(frame[DISPATCH_FRAME_HEADER_BYTES..].to_vec())
     }
 }
 
@@ -1890,9 +1997,37 @@ fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
     Ok(value)
 }
 
-fn to_napi_error<E>(error: E) -> Error
-where
-    E: std::fmt::Display,
-{
-    Error::from_reason(error.to_string())
+unsafe fn read_required_utf8(value: *const u8, len: usize, field: &str) -> Result<String> {
+    if value.is_null() {
+        return Err(anyhow!("{field} pointer was null"));
+    }
+
+    let bytes = slice::from_raw_parts(value, len);
+    std::str::from_utf8(bytes)
+        .map(|text| text.to_owned())
+        .map_err(|_| anyhow!("{field} was not valid UTF-8"))
+}
+
+unsafe fn read_optional_utf8(value: *const u8, len: usize, field: &str) -> Result<Option<String>> {
+    if value.is_null() || len == 0 {
+        return Ok(None);
+    }
+
+    read_required_utf8(value, len, field).map(Some)
+}
+
+fn clear_last_error() {
+    let mut slot = LAST_ERROR.lock().expect("last error mutex poisoned");
+    *slot = None;
+}
+
+fn set_last_error(message: impl AsRef<str>) {
+    let mut cleaned = message.as_ref().replace('\0', " ");
+    if cleaned.is_empty() {
+        cleaned = "unknown native error".to_string();
+    }
+
+    let message = CString::new(cleaned).expect("nul bytes already removed");
+    let mut slot = LAST_ERROR.lock().expect("last error mutex poisoned");
+    *slot = Some(message);
 }

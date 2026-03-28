@@ -27,14 +27,21 @@ if (result.exitCode !== 0) {
 
 const platformArtifact =
   process.platform === "darwin"
-    ? "libhttp_native_napi.dylib"
+    ? "libhttp_native_ffi.dylib"
     : process.platform === "win32"
-      ? "http_native_napi.dll"
-      : "libhttp_native_napi.so";
+      ? "http_native_ffi.dll"
+      : "libhttp_native_ffi.so";
+
+const extension =
+  process.platform === "darwin"
+    ? "dylib"
+    : process.platform === "win32"
+      ? "dll"
+      : "so";
 
 const source = resolve(`rust-native/target/${profile}/${platformArtifact}`);
-const profileTarget = resolve(`http-native.${profile}.node`);
-const defaultTarget = resolve("http-native.node");
+const profileTarget = resolve(`http-native.${profile}.${extension}`);
+const defaultTarget = resolve(`http-native.${extension}`);
 
 if (!existsSync(source)) {
   throw new Error(`Native artifact not found at ${source}`);

@@ -1,9 +1,10 @@
 [package]
-name = "http_native_napi"
+name = "http_native_ffi"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
+name = "http_native_ffi"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -15,15 +16,10 @@ itoa = "1.0"
 json5 = "0.4"
 memchr = "2.7"
 monoio = { version = "0.2", features = ["sync"] }
-napi = { version = "3", default-features = false, features = ["napi8"] }
-napi-derive = "3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 socket2 = { version = "0.5", features = ["all"] }
 url = "2.5"
-
-[build-dependencies]
-napi-build = "2"
 
 [profile.release]
 lto = "fat"
