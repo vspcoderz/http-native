@@ -27,6 +27,7 @@ const EMPTY_BUFFER = Buffer.alloc(0);
 const EMPTY_ARRAY = Object.freeze([]);
 const NOOP_NEXT = () => undefined;
 const ROUTE_CACHE_PROMOTE_HITS = 16;
+let nativeProcessKeepAlive = null;
 const ERROR_REQUEST_PLAN = Object.freeze({
   method: true,
   path: true,
@@ -50,6 +51,23 @@ function normalizePathPrefix(path) {
 
   const trimmed = String(path).replace(/\/+$/, "");
   return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function retainNativeProcessLifetime() {
+  if (nativeProcessKeepAlive) {
+    return;
+  }
+
+  nativeProcessKeepAlive = setInterval(() => {}, 1 << 30);
+}
+
+function releaseNativeProcessLifetime() {
+  if (!nativeProcessKeepAlive || ACTIVE_NATIVE_SERVERS.size > 0) {
+    return;
+  }
+
+  clearInterval(nativeProcessKeepAlive);
+  nativeProcessKeepAlive = null;
 }
 
 function normalizeRoutePath(method, path) {
@@ -451,6 +469,107 @@ function createDispatcher(compiledRoutes, runtimeOptimizer, errorHandlers = []) 
         // an already-resolved Promise. Skip awaiting when response is already done.
         if (!res.finished && isPromiseLike(handlerResult)) {
           await handlerResult;
+        }
+      }
+    } catch (error) {
+      return finalizeError(error, req, res, snapshot, release, 500);
+    }
+
+    const responseSnapshot = snapshot();
+    if (!isBridgeBypassedRoute(route)) {
+      runtimeOptimizer?.recordDispatch(route, req, responseSnapshot);
+    }
+    const encoded = encodeResponseEnvelope(responseSnapshot);
+    maybePromoteRouteResponseCache(route, responseSnapshot, encoded);
+    releaseRequestObject(req);
+    release();
+    return encoded;
+  };
+}
+
+function createDispatcherSync(compiledRoutes, runtimeOptimizer, errorHandlers = []) {
+  const routesById = new Map(compiledRoutes.map((route) => [route.handlerId, route]));
+  const errorRequestFactory = createRequestFactory(ERROR_REQUEST_PLAN, [], null);
+
+  function finalizeError(error, req, res, snapshot, release, fallbackStatus = 500) {
+    try {
+      if (!res.finished) {
+        for (const errorHandler of errorHandlers) {
+          const result = errorHandler(error, req, res);
+          if (!res.finished && isPromiseLike(result)) {
+            throw new TypeError(
+              "Async error handlers are not supported on the native bun:ffi bridge.",
+            );
+          }
+          if (res.finished) {
+            break;
+          }
+        }
+      }
+
+      if (!res.finished) {
+        return encodeResponseEnvelope(buildDefaultErrorSnapshot(error, fallbackStatus));
+      }
+
+      return encodeResponseEnvelope(snapshot());
+    } catch (handlerError) {
+      return serializeErrorResponse(handlerError);
+    } finally {
+      if (req) {
+        releaseRequestObject(req);
+      }
+      release();
+    }
+  }
+
+  return function dispatch(requestBuffer) {
+    let decoded;
+
+    try {
+      decoded = decodeRequestEnvelope(requestBuffer);
+    } catch (error) {
+      return serializeErrorResponse(error);
+    }
+
+    if (decoded.handlerId === 0) {
+      const req = errorRequestFactory(decoded);
+      const { response: res, snapshot, release } = createResponseEnvelope();
+      return finalizeError(
+        createHttpError(404, "Route not found", "NOT_FOUND"),
+        req,
+        res,
+        snapshot,
+        release,
+        404,
+      );
+    }
+
+    const route = routesById.get(decoded.handlerId);
+    if (!route) {
+      return serializeErrorResponse(new Error(`Unknown handler id ${decoded.handlerId}`));
+    }
+
+    const cachedResponse = route.runtimeResponseCache?.encoded;
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+
+    const req = route.requestFactory(decoded);
+    const { response: res, snapshot, release } = createResponseEnvelope(route.jsonSerializer);
+
+    try {
+      const middlewareResult = route.runMiddlewares(req, res);
+      if (!res.finished && isPromiseLike(middlewareResult)) {
+        throw new TypeError(
+          "Async middleware handlers are not supported on the native bun:ffi bridge.",
+        );
+      }
+      if (!res.finished) {
+        const handlerResult = route.compiledHandler(req, res);
+        if (!res.finished && isPromiseLike(handlerResult)) {
+          throw new TypeError(
+            "Async route handlers are not supported on the native bun:ffi bridge.",
+          );
         }
       }
     } catch (error) {
@@ -1306,8 +1425,14 @@ export function createApp() {
         compiledMiddlewares,
         normalizedOptions.opt,
       );
-      const dispatcher = createDispatcher(compiledRoutes, runtimeOptimizer, this._errorHandlers);
-      if (containsAsyncHandlers) {
+      const requiresBridgeDispatch = compiledRoutes.some(
+        (route) => !isBridgeBypassedRoute(route),
+      );
+      const shouldUseBunServerBridge = containsAsyncHandlers || requiresBridgeDispatch;
+      const dispatcher = shouldUseBunServerBridge
+        ? createDispatcher(compiledRoutes, runtimeOptimizer, this._errorHandlers)
+        : createDispatcherSync(compiledRoutes, runtimeOptimizer, this._errorHandlers);
+      if (shouldUseBunServerBridge) {
         return startBunServerBridge(
           compiledRoutes,
           dispatcher,
@@ -1323,6 +1448,7 @@ export function createApp() {
         backlog: normalizedOptions.backlog,
       });
       ACTIVE_NATIVE_SERVERS.add(handle);
+      retainNativeProcessLifetime();
 
       return {
         host: handle.host,
@@ -1339,7 +1465,9 @@ export function createApp() {
         },
         close() {
           ACTIVE_NATIVE_SERVERS.delete(handle);
-          return handle.close();
+          const result = handle.close();
+          releaseNativeProcessLifetime();
+          return result;
         },
       };
     },
