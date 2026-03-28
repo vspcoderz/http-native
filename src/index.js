@@ -1437,11 +1437,6 @@ export function createApp() {
 
     async listen(options = {}) {
       const normalizedOptions = normalizeListenOptions(options);
-      const containsAsyncHandlers = hasAsyncHandlers(
-        this._routes,
-        this._middlewares,
-        this._errorHandlers,
-      );
       const compiledMiddlewares = this._middlewares.map(compileMiddlewareRegistration);
       const errorHandlerPlans = this._errorHandlers.map((handler) =>
         analyzeRequestAccess(Function.prototype.toString.call(handler)),
@@ -1474,6 +1469,8 @@ export function createApp() {
           pathPrefix: middleware.pathPrefix,
         })),
         routes: compiledRoutes.map((route) => ({
+          jsDispatch: !isBridgeBypassedRoute(route),
+          cacheCandidate: !isBridgeBypassedRoute(route) && route.runtimeResponseCache !== null,
           method: route.method,
           methodCode: route.methodCode,
           path: route.path,
@@ -1497,20 +1494,7 @@ export function createApp() {
         compiledMiddlewares,
         normalizedOptions.opt,
       );
-      const requiresBridgeDispatch = compiledRoutes.some(
-        (route) => !isBridgeBypassedRoute(route),
-      );
-      const shouldUseBunServerBridge = containsAsyncHandlers || requiresBridgeDispatch;
-      if (shouldUseBunServerBridge) {
-        return startBunServerBridge(
-          compiledRoutes,
-          runtimeOptimizer,
-          this._errorHandlers,
-          normalizedOptions,
-        );
-      }
-
-      const dispatcher = createDispatcherSync(
+      const dispatcher = createDispatcher(
         compiledRoutes,
         runtimeOptimizer,
         this._errorHandlers,

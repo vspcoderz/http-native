@@ -137,7 +137,7 @@ export interface ServerHandle {
   };
 
   /** Gracefully close the server */
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 export interface OptimizationSnapshot {

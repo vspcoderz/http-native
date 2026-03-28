@@ -48,4 +48,8 @@ pub struct RouteInput {
     pub needs_url: bool,
     #[serde(default)]
     pub needs_query: bool,
+    #[serde(default)]
+    pub js_dispatch: bool,
+    #[serde(default)]
+    pub cache_candidate: bool,
 }

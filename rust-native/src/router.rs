@@ -40,6 +40,10 @@ pub struct MatchedRoute<'a, 'b> {
     pub needs_path: bool,
     pub needs_url: bool,
     pub needs_query: bool,
+    #[allow(dead_code)]
+    pub js_dispatch: bool,
+    #[allow(dead_code)]
+    pub cache_candidate: bool,
     pub fast_path: Option<&'a DynamicFastPathSpec>,
 }
 
@@ -54,6 +58,8 @@ struct DynamicRouteSpec {
     needs_path: bool,
     needs_url: bool,
     needs_query: bool,
+    js_dispatch: bool,
+    cache_candidate: bool,
     fast_path: Option<DynamicFastPathSpec>,
 }
 
@@ -281,6 +287,8 @@ impl Router {
                 needs_path: route_spec.needs_path,
                 needs_url: route_spec.needs_url,
                 needs_query: route_spec.needs_query,
+                js_dispatch: route_spec.js_dispatch,
+                cache_candidate: route_spec.cache_candidate,
                 fast_path: route_spec.fast_path.as_ref(),
             });
         }
@@ -306,6 +314,8 @@ impl Router {
             needs_path: spec.needs_path,
             needs_url: spec.needs_url,
             needs_query: spec.needs_query,
+            js_dispatch: spec.js_dispatch,
+            cache_candidate: spec.cache_candidate,
             fast_path: spec.fast_path.as_ref(),
         })
     }
@@ -393,6 +403,8 @@ fn compile_dynamic_route_spec(route: &RouteInput, middlewares: &[MiddlewareInput
         needs_path: route.needs_path,
         needs_url: route.needs_url,
         needs_query: route.needs_query,
+        js_dispatch: route.js_dispatch,
+        cache_candidate: route.cache_candidate,
         fast_path: analyze_dynamic_fast_path(route, middlewares),
     }
 }

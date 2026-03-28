@@ -124,7 +124,8 @@ async function main() {
   const app = createApp();
   assert.equal(typeof app.error, "function");
 
-  app.error((error, req, res) => {
+  app.error(async (error, req, res) => {
+    await Promise.resolve();
     observedErrors.push({
       path: req.path,
       status: Number(error?.status ?? 500),

@@ -14,6 +14,16 @@ const DEFAULT_OUTPUT_DIR = "bench/results";
 const DEFAULT_HTTP_NATIVE_RUNTIME = "bun";
 const DEFAULT_BOMBARDIER_BIN = resolveBombardierBin();
 const SUPPORTED_HTTP_NATIVE_RUNTIMES = new Set(["bun", "node"]);
+const NAPI_RS_LINUX_BASELINE_RPS = Object.freeze({
+  static: 95665.54,
+  dynamic: 57779.86,
+  opt: 72566.59,
+});
+const NATIVE_PARITY_MIN_RATIO = Object.freeze({
+  static: 0.95,
+  dynamic: 0.9,
+  opt: 0.9,
+});
 
 const SERVER_PORTS = Object.freeze({
   bun: { static: 3000, dynamic: 3010, opt: 3020 },
@@ -65,6 +75,7 @@ async function main() {
     },
     results,
   };
+  payload.parityGate = evaluateNativeParityGate(payload);
 
   const summary = renderSummary(payload);
   const jsonPath = resolve(outputDir, "results.json");
@@ -83,6 +94,18 @@ async function main() {
   console.log(summary);
   console.log(`[http-native][bench] wrote ${jsonPath}`);
   console.log(`[http-native][bench] wrote ${markdownPath}`);
+  if (payload.parityGate?.status === "failed") {
+    const failures = payload.parityGate.checks
+      .filter((check) => check.pass === false)
+      .map(
+        (check) =>
+          `${check.scenario} ${formatNumber(check.actualRps)} RPS < ${formatNumber(
+            check.requiredRps,
+          )} RPS (${formatNumber(check.minRatio * 100, 1)}%)`,
+      )
+      .join("; ");
+    throw new Error(`http-native parity gate failed: ${failures}`);
+  }
   process.exit(0);
 }
 
@@ -530,8 +553,72 @@ function renderSummary(payload) {
     );
   }
 
+  if (payload.parityGate && payload.parityGate.status !== "skipped") {
+    lines.push("");
+    lines.push("## Native Parity Gate (Linux CI)");
+    lines.push("");
+    lines.push("| Scenario | Actual RPS | Baseline RPS | Min Ratio | Actual Ratio | Status |");
+    lines.push("| --- | ---: | ---: | ---: | ---: | --- |");
+    for (const check of payload.parityGate.checks) {
+      lines.push(
+        `| ${check.scenario} | ${formatNumber(check.actualRps)} | ${formatNumber(
+          check.baselineRps,
+        )} | ${formatNumber(check.minRatio * 100, 1)}% | ${formatNumber(
+          check.actualRatio * 100,
+          1,
+        )}% | ${check.pass ? "pass" : "fail"} |`,
+      );
+    }
+  }
+
   lines.push("");
   return `${lines.join("\n")}\n`;
+}
+
+function evaluateNativeParityGate(payload) {
+  if (process.env.HTTP_NATIVE_DISABLE_PARITY_GATE === "1") {
+    return { status: "skipped", reason: "disabled by env" };
+  }
+
+  const isLinuxCi = process.platform === "linux" && process.env.CI === "true";
+  if (!isLinuxCi) {
+    return { status: "skipped", reason: "requires linux CI" };
+  }
+
+  const checks = [];
+  for (const scenario of ["static", "dynamic", "opt"]) {
+    const result = payload.results.find(
+      (entry) => entry.engine === "http-native" && entry.scenario === scenario,
+    );
+    if (!result) {
+      continue;
+    }
+
+    const baselineRps = NAPI_RS_LINUX_BASELINE_RPS[scenario];
+    const minRatio = NATIVE_PARITY_MIN_RATIO[scenario];
+    const actualRps = Number(result.result.rps.mean);
+    const requiredRps = baselineRps * minRatio;
+    const actualRatio = baselineRps > 0 ? actualRps / baselineRps : 0;
+
+    checks.push({
+      scenario,
+      baselineRps,
+      actualRps,
+      requiredRps,
+      minRatio,
+      actualRatio,
+      pass: actualRps >= requiredRps,
+    });
+  }
+
+  if (checks.length === 0) {
+    return { status: "skipped", reason: "no http-native scenarios benchmarked" };
+  }
+
+  return {
+    status: checks.every((check) => check.pass) ? "passed" : "failed",
+    checks,
+  };
 }
 
 function formatNumber(value, digits = 2) {

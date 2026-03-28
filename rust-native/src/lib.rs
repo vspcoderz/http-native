@@ -9,12 +9,15 @@ use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CString};
+use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 use url::form_urlencoded;
 
 use crate::analyzer::{
@@ -59,12 +62,484 @@ const BUFFER_INITIAL_CAPACITY: usize = 8192;
 const BUFFER_POOL_MAX_SIZE: usize = 256;
 /// Buffer pool: max buffer size to recycle (don't recycle oversized buffers)
 const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
-const DISPATCH_FRAME_HEADER_BYTES: usize = 4;
-const MAX_DISPATCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_DISPATCH_QUEUE_CAPACITY: usize = 8192;
+const DEFAULT_DISPATCH_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_DISPATCH_BATCH_MAX_ITEMS: u32 = 64;
+const DEFAULT_DISPATCH_BATCH_MAX_BYTES: usize = 1024 * 1024;
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 4096;
+const DEFAULT_CACHE_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_CACHE_MAX_VALUE_BYTES: usize = 128 * 1024;
+const DEFAULT_CACHE_PROMOTE_HITS: u32 = 16;
 
 type Buffer = Vec<u8>;
-type DispatchCallback = unsafe extern "C" fn(*const u8, usize) -> *const u8;
 static LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
+
+#[derive(Default)]
+struct DispatchMetrics {
+    queue_depth_peak: u64,
+    queue_full_drops: u64,
+    dispatch_timeouts: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_promotions: u64,
+    dispatch_wait_ns_total: u64,
+    dispatch_wait_samples: u64,
+}
+
+struct DispatchCacheEntry {
+    stable_hits: u32,
+    last_response_hash: u64,
+    cached: Option<Vec<u8>>,
+    last_touch: u64,
+}
+
+struct DispatchQueuedRequest {
+    request_id: u64,
+    payload: Buffer,
+}
+
+struct DispatchBridgeState {
+    queue: VecDeque<DispatchQueuedRequest>,
+    pending: HashMap<u64, mpsc::SyncSender<Buffer>>,
+    batch_allocs: HashMap<usize, usize>,
+    cache: HashMap<Vec<u8>, DispatchCacheEntry>,
+    cache_total_bytes: usize,
+    touch_counter: u64,
+    metrics: DispatchMetrics,
+}
+
+struct DispatchBridgeConfig {
+    queue_capacity: usize,
+    dispatch_timeout: Duration,
+    batch_max_items: u32,
+    batch_max_bytes: usize,
+    cache_max_entries: usize,
+    cache_max_total_bytes: usize,
+    cache_max_value_bytes: usize,
+    cache_promote_hits: u32,
+    debug: bool,
+}
+
+struct DispatchBridge {
+    next_request_id: AtomicU64,
+    cache_candidate_handlers: HashSet<u32>,
+    config: DispatchBridgeConfig,
+    state: Mutex<DispatchBridgeState>,
+}
+
+impl DispatchBridge {
+    fn from_env(cache_candidate_handlers: HashSet<u32>) -> Self {
+        let config = DispatchBridgeConfig {
+            queue_capacity: read_env_usize(
+                "HTTP_NATIVE_DISPATCH_QUEUE_CAPACITY",
+                DEFAULT_DISPATCH_QUEUE_CAPACITY,
+                1,
+                1_000_000,
+            ),
+            dispatch_timeout: Duration::from_millis(read_env_u64(
+                "HTTP_NATIVE_DISPATCH_TIMEOUT_MS",
+                DEFAULT_DISPATCH_TIMEOUT_MS,
+                1,
+                60_000,
+            )),
+            batch_max_items: read_env_u32(
+                "HTTP_NATIVE_DISPATCH_BATCH_MAX_ITEMS",
+                DEFAULT_DISPATCH_BATCH_MAX_ITEMS,
+                1,
+                4_096,
+            ),
+            batch_max_bytes: read_env_usize(
+                "HTTP_NATIVE_DISPATCH_BATCH_MAX_BYTES",
+                DEFAULT_DISPATCH_BATCH_MAX_BYTES,
+                4 * 1024,
+                16 * 1024 * 1024,
+            ),
+            cache_max_entries: read_env_usize(
+                "HTTP_NATIVE_CACHE_MAX_ENTRIES",
+                DEFAULT_CACHE_MAX_ENTRIES,
+                0,
+                1_000_000,
+            ),
+            cache_max_total_bytes: read_env_usize(
+                "HTTP_NATIVE_CACHE_MAX_TOTAL_BYTES",
+                DEFAULT_CACHE_MAX_TOTAL_BYTES,
+                0,
+                2 * 1024 * 1024 * 1024,
+            ),
+            cache_max_value_bytes: read_env_usize(
+                "HTTP_NATIVE_CACHE_MAX_VALUE_BYTES",
+                DEFAULT_CACHE_MAX_VALUE_BYTES,
+                0,
+                4 * 1024 * 1024,
+            ),
+            cache_promote_hits: read_env_u32(
+                "HTTP_NATIVE_CACHE_PROMOTE_HITS",
+                DEFAULT_CACHE_PROMOTE_HITS,
+                1,
+                10_000,
+            ),
+            debug: read_env_bool("HTTP_NATIVE_BRIDGE_DEBUG"),
+        };
+
+        Self {
+            next_request_id: AtomicU64::new(1),
+            cache_candidate_handlers,
+            config,
+            state: Mutex::new(DispatchBridgeState {
+                queue: VecDeque::new(),
+                pending: HashMap::new(),
+                batch_allocs: HashMap::new(),
+                cache: HashMap::new(),
+                cache_total_bytes: 0,
+                touch_counter: 0,
+                metrics: DispatchMetrics::default(),
+            }),
+        }
+    }
+
+    fn dispatch(&self, request: Buffer) -> Result<Buffer> {
+        let handler_id = extract_handler_id(request.as_slice()).unwrap_or_default();
+        let cache_eligible = self.cache_candidate_handlers.contains(&handler_id);
+        let cache_key = if cache_eligible {
+            Some(request.clone())
+        } else {
+            None
+        };
+        if cache_eligible {
+            if let Some(hit) = self.try_cache_hit(request.as_slice()) {
+                return Ok(hit);
+            }
+        }
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = mpsc::sync_channel::<Buffer>(1);
+
+        {
+            let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+            if state.queue.len() >= self.config.queue_capacity {
+                state.metrics.queue_full_drops = state.metrics.queue_full_drops.saturating_add(1);
+                if self.config.debug {
+                    eprintln!("[http-native][bridge] queue full");
+                }
+                return Err(anyhow!("dispatch queue full"));
+            }
+            state.pending.insert(request_id, response_tx);
+            state.queue.push_back(DispatchQueuedRequest {
+                request_id,
+                payload: request,
+            });
+            let depth = state.queue.len() as u64;
+            if depth > state.metrics.queue_depth_peak {
+                state.metrics.queue_depth_peak = depth;
+            }
+        }
+
+        let wait_started = Instant::now();
+        let response = match response_rx.recv_timeout(self.config.dispatch_timeout) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+                state.pending.remove(&request_id);
+                state.metrics.dispatch_timeouts = state.metrics.dispatch_timeouts.saturating_add(1);
+                if self.config.debug {
+                    eprintln!("[http-native][bridge] dispatch timeout for request_id={request_id}");
+                }
+                return Err(anyhow!("dispatch timed out"));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+                state.pending.remove(&request_id);
+                return Err(anyhow!("dispatch channel disconnected"));
+            }
+        };
+
+        let wait_ns = wait_started.elapsed().as_nanos() as u64;
+        {
+            let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+            state.metrics.dispatch_wait_ns_total =
+                state.metrics.dispatch_wait_ns_total.saturating_add(wait_ns);
+            state.metrics.dispatch_wait_samples =
+                state.metrics.dispatch_wait_samples.saturating_add(1);
+        }
+
+        if let Some(cache_key) = cache_key.as_ref() {
+            self.observe_cache(cache_key.as_slice(), response.as_slice());
+        }
+
+        Ok(response)
+    }
+
+    fn poll_dispatch_batch(&self, requested_max_items: u32) -> Result<*mut u8> {
+        let max_items = if requested_max_items == 0 {
+            self.config.batch_max_items
+        } else {
+            requested_max_items.min(self.config.batch_max_items)
+        };
+        if max_items == 0 {
+            return Ok(ptr::null_mut());
+        }
+
+        let mut batch_items: Vec<DispatchQueuedRequest> = Vec::new();
+        let mut payload_bytes = 4usize; // item_count
+        {
+            let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+            if state.queue.is_empty() {
+                return Ok(ptr::null_mut());
+            }
+
+            while (batch_items.len() as u32) < max_items {
+                let Some(next) = state.queue.front() else {
+                    break;
+                };
+                let item_size = 12usize
+                    .checked_add(next.payload.len())
+                    .ok_or_else(|| anyhow!("dispatch batch item size overflow"))?;
+                if !batch_items.is_empty()
+                    && payload_bytes
+                        .checked_add(item_size)
+                        .ok_or_else(|| anyhow!("dispatch batch size overflow"))?
+                        > self.config.batch_max_bytes
+                {
+                    break;
+                }
+
+                payload_bytes = payload_bytes
+                    .checked_add(item_size)
+                    .ok_or_else(|| anyhow!("dispatch batch size overflow"))?;
+                let item = state
+                    .queue
+                    .pop_front()
+                    .ok_or_else(|| anyhow!("dispatch queue underflow"))?;
+                batch_items.push(item);
+            }
+        }
+
+        if batch_items.is_empty() {
+            return Ok(ptr::null_mut());
+        }
+
+        let mut frame = Vec::with_capacity(
+            payload_bytes
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("dispatch frame size overflow"))?,
+        );
+        push_u32(&mut frame, payload_bytes as u32);
+        push_u32(&mut frame, batch_items.len() as u32);
+        for item in batch_items {
+            frame.extend_from_slice(&item.request_id.to_le_bytes());
+            push_u32(&mut frame, item.payload.len() as u32);
+            frame.extend_from_slice(item.payload.as_slice());
+        }
+        frame.shrink_to_fit();
+
+        let ptr = frame.as_mut_ptr();
+        let len = frame.len();
+        {
+            let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+            state.batch_allocs.insert(ptr as usize, len);
+        }
+        std::mem::forget(frame);
+        Ok(ptr)
+    }
+
+    fn free_dispatch_batch(&self, batch_ptr: *mut u8) {
+        if batch_ptr.is_null() {
+            return;
+        }
+
+        let len = {
+            let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+            state.batch_allocs.remove(&(batch_ptr as usize))
+        };
+        if let Some(len) = len {
+            unsafe {
+                drop(Vec::from_raw_parts(batch_ptr, len, len));
+            }
+        }
+    }
+
+    fn submit_response(&self, request_id: u64, response: Buffer) -> bool {
+        let sender = {
+            let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+            state.pending.remove(&request_id)
+        };
+        let Some(sender) = sender else {
+            return false;
+        };
+        sender.send(response).is_ok()
+    }
+
+    fn try_cache_hit(&self, cache_key: &[u8]) -> Option<Buffer> {
+        let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+        state.touch_counter = state.touch_counter.wrapping_add(1);
+        let touch = state.touch_counter;
+        let mut hit = None;
+        if let Some(entry) = state.cache.get_mut(cache_key) {
+            entry.last_touch = touch;
+            if let Some(value) = entry.cached.as_ref() {
+                hit = Some(value.clone());
+            }
+        }
+
+        if hit.is_some() {
+            state.metrics.cache_hits = state.metrics.cache_hits.saturating_add(1);
+        } else {
+            state.metrics.cache_misses = state.metrics.cache_misses.saturating_add(1);
+        }
+        hit
+    }
+
+    fn observe_cache(&self, cache_key: &[u8], response: &[u8]) {
+        if self.config.cache_max_entries == 0
+            || self.config.cache_max_total_bytes == 0
+            || self.config.cache_max_value_bytes == 0
+        {
+            return;
+        }
+
+        let response_hash = hash_bytes(response);
+        let mut state = self.state.lock().expect("dispatch bridge mutex poisoned");
+        state.touch_counter = state.touch_counter.wrapping_add(1);
+        let touch = state.touch_counter;
+
+        let mut promoted = false;
+        let mut promote_len = 0usize;
+        let mut removed_prev_len = 0usize;
+
+        if let Some(entry) = state.cache.get_mut(cache_key) {
+            entry.last_touch = touch;
+            if entry.last_response_hash == response_hash {
+                entry.stable_hits = entry.stable_hits.saturating_add(1);
+            } else {
+                entry.stable_hits = 1;
+                entry.last_response_hash = response_hash;
+                if let Some(prev) = entry.cached.take() {
+                    removed_prev_len = prev.len();
+                }
+            }
+
+            if entry.cached.is_none()
+                && entry.stable_hits >= self.config.cache_promote_hits
+                && response.len() <= self.config.cache_max_value_bytes
+            {
+                entry.cached = Some(response.to_vec());
+                promoted = true;
+                promote_len = response.len();
+            }
+        } else {
+            state.cache.insert(
+                cache_key.to_vec(),
+                DispatchCacheEntry {
+                    stable_hits: 1,
+                    last_response_hash: response_hash,
+                    cached: None,
+                    last_touch: touch,
+                },
+            );
+        }
+
+        if removed_prev_len > 0 {
+            state.cache_total_bytes = state.cache_total_bytes.saturating_sub(removed_prev_len);
+        }
+        if promoted {
+            state.cache_total_bytes = state.cache_total_bytes.saturating_add(promote_len);
+            state.metrics.cache_promotions = state.metrics.cache_promotions.saturating_add(1);
+        }
+
+        evict_dispatch_cache(&mut state, &self.config);
+    }
+
+    fn debug_snapshot(&self) -> Option<String> {
+        if !self.config.debug {
+            return None;
+        }
+        let state = self.state.lock().expect("dispatch bridge mutex poisoned");
+        let avg_wait_ms = if state.metrics.dispatch_wait_samples == 0 {
+            0.0
+        } else {
+            (state.metrics.dispatch_wait_ns_total as f64
+                / state.metrics.dispatch_wait_samples as f64)
+                / 1_000_000.0
+        };
+        Some(format!(
+            "queue_depth={} queue_depth_peak={} queue_full={} timeouts={} cache_hit={} cache_miss={} cache_promotions={} avg_wait_ms={avg_wait_ms:.3}",
+            state.queue.len(),
+            state.metrics.queue_depth_peak,
+            state.metrics.queue_full_drops,
+            state.metrics.dispatch_timeouts,
+            state.metrics.cache_hits,
+            state.metrics.cache_misses,
+            state.metrics.cache_promotions,
+        ))
+    }
+}
+
+fn evict_dispatch_cache(state: &mut DispatchBridgeState, config: &DispatchBridgeConfig) {
+    while state.cache.len() > config.cache_max_entries
+        || state.cache_total_bytes > config.cache_max_total_bytes
+    {
+        let Some(evict_key) = state
+            .cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_touch)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+
+        if let Some(entry) = state.cache.remove(evict_key.as_slice()) {
+            if let Some(value) = entry.cached {
+                state.cache_total_bytes = state.cache_total_bytes.saturating_sub(value.len());
+            }
+        }
+    }
+}
+
+fn extract_handler_id(request: &[u8]) -> Option<u32> {
+    if request.len() < 8 {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        request[4], request[5], request[6], request[7],
+    ]))
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn read_env_usize(name: &str, fallback: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(fallback)
+}
+
+fn read_env_u64(name: &str, fallback: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(fallback)
+}
+
+fn read_env_u32(name: &str, fallback: u32, min: u32, max: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(fallback)
+}
+
+fn read_env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
 
 // ─── Thread-Local Buffer Pool ─────────────────────────────────────────────────
 //
@@ -190,6 +665,7 @@ pub struct NativeServerHandle {
     host: String,
     port: u32,
     url: String,
+    bridge: Arc<DispatchBridge>,
     shutdown: Mutex<Option<ShutdownHandle>>,
     closed: Mutex<Option<Vec<mpsc::Receiver<()>>>>,
 }
@@ -215,9 +691,7 @@ impl NativeServerHandle {
             .take()
         {
             shutdown.flag.store(true, Ordering::SeqCst);
-            for wake_addr in shutdown.wake_addrs {
-                let _ = std::net::TcpStream::connect(wake_addr);
-            }
+            wake_workers(shutdown.wake_addrs.as_slice(), 8);
         }
 
         if let Some(receivers) = self.closed.lock().expect("closed mutex poisoned").take() {
@@ -232,11 +706,23 @@ impl NativeServerHandle {
 
 fn start_server_internal(
     manifest_json: &str,
-    dispatcher: Arc<JsDispatcher>,
     options: NativeListenOptions,
 ) -> Result<NativeServerHandle> {
     let manifest: ManifestInput = serde_json::from_str(manifest_json)?;
     validate_manifest(&manifest)?;
+    let cache_candidate_handlers = manifest
+        .routes
+        .iter()
+        .filter(|route| route.js_dispatch && route.cache_candidate)
+        .map(|route| route.handler_id)
+        .collect::<HashSet<_>>();
+    let bridge = Arc::new(DispatchBridge::from_env(cache_candidate_handlers));
+    let dispatcher = Arc::new(JsDispatcher {
+        bridge: Arc::clone(&bridge),
+    });
+    if let Some(snapshot) = bridge.debug_snapshot() {
+        eprintln!("[http-native][bridge] {snapshot}");
+    }
     let server_config = Arc::new(HttpServerConfig::from_manifest(&manifest)?);
     let router = Arc::new(Router::from_manifest(&manifest)?);
 
@@ -304,9 +790,7 @@ fn start_server_internal(
             }
             Ok(Err(message)) => {
                 shutdown_flag.store(true, Ordering::SeqCst);
-                for wake_addr in &wake_addrs {
-                    let _ = std::net::TcpStream::connect(*wake_addr);
-                }
+                wake_workers(wake_addrs.as_slice(), 4);
                 for receiver in closed_receivers {
                     let _ = receiver.recv();
                 }
@@ -314,9 +798,7 @@ fn start_server_internal(
             }
             Err(_) => {
                 shutdown_flag.store(true, Ordering::SeqCst);
-                for wake_addr in &wake_addrs {
-                    let _ = std::net::TcpStream::connect(*wake_addr);
-                }
+                wake_workers(wake_addrs.as_slice(), 4);
                 for receiver in closed_receivers {
                     let _ = receiver.recv();
                 }
@@ -334,6 +816,7 @@ fn start_server_internal(
         host: host.clone(),
         port,
         url: format!("http://{host}:{port}"),
+        bridge,
         shutdown: Mutex::new(Some(ShutdownHandle {
             flag: shutdown_flag,
             wake_addrs,
@@ -346,7 +829,6 @@ fn start_server_internal(
 pub unsafe extern "C" fn http_native_start_server(
     manifest_json_ptr: *const u8,
     manifest_json_len: usize,
-    dispatch_callback: Option<DispatchCallback>,
     host_ptr: *const u8,
     host_len: usize,
     port: u16,
@@ -355,18 +837,13 @@ pub unsafe extern "C" fn http_native_start_server(
     let start_result = (|| -> Result<NativeServerHandle> {
         let manifest_json = read_required_utf8(manifest_json_ptr, manifest_json_len, "manifest_json")?;
         let host = read_optional_utf8(host_ptr, host_len, "host")?;
-        let callback = dispatch_callback.ok_or_else(|| anyhow!("dispatch callback was null"))?;
         let options = NativeListenOptions {
             host,
             port,
             backlog: (backlog > 0).then_some(backlog),
         };
 
-        start_server_internal(
-            manifest_json.as_str(),
-            Arc::new(JsDispatcher { callback }),
-            options,
-        )
+        start_server_internal(manifest_json.as_str(), options)
     })();
 
     match start_result {
@@ -379,6 +856,77 @@ pub unsafe extern "C" fn http_native_start_server(
             ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_poll_dispatch_batch(
+    handle: *mut NativeServerHandle,
+    max_items: u32,
+) -> *mut u8 {
+    if handle.is_null() {
+        set_last_error("server handle was null");
+        return ptr::null_mut();
+    }
+
+    let handle_ref = &*handle;
+    match handle_ref.bridge.poll_dispatch_batch(max_items) {
+        Ok(ptr) => {
+            clear_last_error();
+            ptr
+        }
+        Err(error) => {
+            set_last_error(error.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_dispatch_batch_free(
+    handle: *mut NativeServerHandle,
+    batch_ptr: *mut u8,
+) {
+    if handle.is_null() {
+        if !batch_ptr.is_null() {
+            set_last_error("server handle was null");
+        }
+        return;
+    }
+
+    let handle_ref = &*handle;
+    handle_ref.bridge.free_dispatch_batch(batch_ptr);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn http_native_submit_dispatch_response(
+    handle: *mut NativeServerHandle,
+    request_id: u64,
+    response_ptr: *const u8,
+    response_len: usize,
+) -> bool {
+    if handle.is_null() {
+        set_last_error("server handle was null");
+        return false;
+    }
+    if response_ptr.is_null() && response_len > 0 {
+        set_last_error("response pointer was null");
+        return false;
+    }
+
+    let response = if response_len == 0 {
+        Buffer::new()
+    } else {
+        slice::from_raw_parts(response_ptr, response_len).to_vec()
+    };
+    let handle_ref = &*handle;
+    let submitted = handle_ref.bridge.submit_response(request_id, response);
+    if !submitted {
+        set_last_error("request id not pending");
+        return false;
+    }
+
+    clear_last_error();
+    true
 }
 
 #[no_mangle]
@@ -458,40 +1006,35 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|count| *count > 0)
-        .unwrap_or(1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().clamp(1, 16))
+                .unwrap_or(1)
+        })
+}
+
+fn wake_workers(addrs: &[SocketAddr], attempts_per_worker: usize) {
+    if addrs.is_empty() {
+        return;
+    }
+
+    let repeats = attempts_per_worker.max(1);
+    let attempts = addrs.len().saturating_mul(repeats);
+    for attempt in 0..attempts {
+        let addr = addrs[attempt % addrs.len()];
+        let _ = std::net::TcpStream::connect(addr);
+    }
 }
 
 // ─── JS Dispatcher ────────────────────────────────────────────────────────────
 
 struct JsDispatcher {
-    callback: DispatchCallback,
+    bridge: Arc<DispatchBridge>,
 }
 
 impl JsDispatcher {
-    async fn dispatch(&self, request: Buffer) -> Result<Buffer> {
-        let response_ptr = unsafe { (self.callback)(request.as_ptr(), request.len()) };
-        if response_ptr.is_null() {
-            return Err(anyhow!("dispatcher callback returned a null response"));
-        }
-
-        let frame_header =
-            unsafe { slice::from_raw_parts(response_ptr, DISPATCH_FRAME_HEADER_BYTES) };
-        let response_len = u32::from_le_bytes([
-            frame_header[0],
-            frame_header[1],
-            frame_header[2],
-            frame_header[3],
-        ]) as usize;
-
-        if response_len > MAX_DISPATCH_RESPONSE_BYTES {
-            return Err(anyhow!("dispatch response exceeded limit"));
-        }
-
-        let frame_len = DISPATCH_FRAME_HEADER_BYTES
-            .checked_add(response_len)
-            .ok_or_else(|| anyhow!("dispatch response frame overflow"))?;
-        let frame = unsafe { slice::from_raw_parts(response_ptr, frame_len) };
-        Ok(frame[DISPATCH_FRAME_HEADER_BYTES..].to_vec())
+    fn dispatch(&self, request: Buffer) -> Result<Buffer> {
+        self.bridge.dispatch(request)
     }
 }
 
@@ -1539,7 +2082,7 @@ async fn write_dynamic_dispatch_response(
     request: Buffer,
     keep_alive: bool,
 ) -> Result<()> {
-    match dispatcher.dispatch(request).await {
+    match dispatcher.dispatch(request) {
         Ok(response) => {
             match build_http_response_from_dispatch(response.as_ref(), keep_alive) {
                 Ok(http_response) => {
@@ -1561,8 +2104,8 @@ async fn write_dynamic_dispatch_response(
         Err(_) => {
             // Security: sanitized error — no internal details
             let response = build_error_response_bytes(
-                502,
-                b"{\"error\":\"Bad Gateway\"}",
+                503,
+                b"{\"error\":\"Service Unavailable\"}",
                 keep_alive,
             );
             let (write_result, _) = stream.write_all(response).await;
