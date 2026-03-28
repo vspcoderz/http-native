@@ -64,7 +64,7 @@ const BUFFER_POOL_MAX_SIZE: usize = 256;
 const BUFFER_POOL_MAX_RECYCLE_SIZE: usize = 65536;
 const DEFAULT_DISPATCH_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_DISPATCH_TIMEOUT_MS: u64 = 3000;
-const DEFAULT_DISPATCH_BATCH_MAX_ITEMS: u32 = 64;
+const DEFAULT_DISPATCH_BATCH_MAX_ITEMS: u32 = 256;
 const DEFAULT_DISPATCH_BATCH_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 4096;
 const DEFAULT_CACHE_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -1008,7 +1008,12 @@ fn worker_count_for(options: &NativeListenOptions) -> usize {
         .filter(|count| *count > 0)
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|parallelism| parallelism.get().clamp(1, 16))
+                .map(|parallelism| {
+                    parallelism
+                        .get()
+                        .saturating_mul(4)
+                        .clamp(4, 64)
+                })
                 .unwrap_or(1)
         })
 }

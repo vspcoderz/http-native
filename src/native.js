@@ -12,7 +12,7 @@ const DISPATCH_BATCH_IDLE_MS = Number.parseInt(
   10,
 );
 const DISPATCH_BATCH_MAX_ITEMS = Number.parseInt(
-  process.env.HTTP_NATIVE_DISPATCH_BATCH_MAX_ITEMS ?? "64",
+  process.env.HTTP_NATIVE_DISPATCH_BATCH_MAX_ITEMS ?? "256",
   10,
 );
 const platformNativeExtension =
